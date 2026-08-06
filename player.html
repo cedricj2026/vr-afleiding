@@ -617,7 +617,9 @@ function runActions(actions){
       if (videoEl && !isNaN(t)){
         videoEl.currentTime = t;
         lastCheckedVideoMs = t * 1000; // on ignore les timers situés avant le point d'arrivée du saut
-        log('jump: vidéo -> '+t+'s');
+        // Une fois qu'on a "choisi" une distraction et qu'on saute vers sa conséquence,
+        // plus aucun trigger de la scène ne doit pouvoir se redéclencher.
+        hotspotObjects.forEach(h => { if (h.isTrigger) h.mesh.visible = false; });
       } else if (sceneMap[a.target]){
         loadScene(a.target);
       } else {
