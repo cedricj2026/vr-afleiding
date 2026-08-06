@@ -30,7 +30,8 @@
    CONFIG — tous les réglages "à la main" regroupés ici.
    ============================================================ */
 const CONFIG = {
-  DWELL_TIME: 1500,      // ms de regard soutenu pour déclencher un hotspot
+  DWELL_TIME: 1000,      // ms de regard soutenu pour déclencher un hotspot
+  HEAD_TILT_DOWN_DEG: 15, // incline le regard/reticule vers le bas (position plus naturelle)
   SCENE_RADIUS: 10,      // échelle des hotspots/images (CenarioVR utilise une sphère unitaire, on l'agrandit)
 
   // Mode calage : en production, reste à false — les zones de trigger invisibles sont
@@ -223,7 +224,8 @@ function buildReticle(){
   reticleInner = new THREE.Mesh(innerGeo, innerMat);
   reticle.add(reticleInner);
 
-  reticle.position.set(0,0,-1.5); // toujours à 1.5m devant la caméra
+  const tiltRad = THREE.MathUtils.degToRad(CONFIG.HEAD_TILT_DOWN_DEG);
+  reticle.position.set(0, -1.5*Math.sin(tiltRad), -1.5*Math.cos(tiltRad)); // 1.5m devant, incliné vers le bas
   reticle.renderOrder = 999;
   camera.add(reticle);
   scene.add(camera);
@@ -306,13 +308,13 @@ function disposeObject3D(obj){
 
 let ambientVideoEls = []; // vidéos-objets (obj.type === 'video'), en plus de la vidéo panoramique principale
 let videoTimersState = []; // timers de la scène vidéo courante : {time, actions, fired}
-let lastCheckedVideoMs = 0; // dernière position de lecture vérifiée (voir listener 'timeupdate')
+let lastCheckedVideoMs = -1; // dernière position vérifiée (-1 pour capter aussi un timer exactement à 0ms)
 
 function clearCurrentScene(){
   sceneTimers.forEach(t => clearTimeout(t));
   sceneTimers = [];
   videoTimersState = [];
-  lastCheckedVideoMs = 0;
+  lastCheckedVideoMs = -1;
   hotspotObjects = [];
 
   ambientAudioEls.forEach(a => { a.pause(); a.removeAttribute('src'); a.load(); });
@@ -407,7 +409,7 @@ function loadSceneInner(sceneId){
     // peut sauter en avant dans la vidéo : un setTimeout classique se déclencherait au
     // mauvais moment (trop tôt ou trop tard) par rapport à ce que montre réellement la vidéo.
     videoTimersState = (s.timers||[]).map(t => ({ time: t.time, actions: t.actions, fired:false }));
-    lastCheckedVideoMs = 0;
+    lastCheckedVideoMs = -1;
     videoEl.addEventListener('timeupdate', () => {
       const curMs = videoEl.currentTime * 1000;
       videoTimersState.forEach(vt => {
@@ -516,7 +518,7 @@ function buildObject(obj, sceneId, triggerIndex){
 
     (isTrigger ? triggerZoneGroup : iconHotspotGroup).add(mesh);
     const entry = {
-      mesh, data: obj, isTrigger,
+      mesh, data: obj, isTrigger, interactive: true, // vrai bouton : réagit au regard
       pitchDeg: obj.pitch||0,
       // Distance légèrement réduite pour être toujours rendu devant les images (évite le z-fighting)
       distanceVal: (obj.distance||1) * CONFIG.SCENE_RADIUS * 0.97,
@@ -544,7 +546,7 @@ function buildObject(obj, sceneId, triggerIndex){
     mesh.visible = obj.visible !== false;
     iconHotspotGroup.add(mesh); // décoratif, suit le calage des icônes
     const entry = {
-      mesh, data: obj, isTrigger: false,
+      mesh, data: obj, isTrigger: false, interactive: false, // décoratif : ne réagit pas au regard
       pitchDeg: obj.pitch||0,
       distanceVal: (obj.distance||1) * CONFIG.SCENE_RADIUS,
       baseYawDeg: seed.baseYawDeg,
@@ -646,15 +648,20 @@ function triggerHotspot(h){
    BOUCLE DE RENDU
    ============================================================ */
 let lastFrameTime = performance.now();
+const GAZE_TILT_QUAT = new THREE.Quaternion().setFromAxisAngle(
+  new THREE.Vector3(1,0,0), -THREE.MathUtils.degToRad(CONFIG.HEAD_TILT_DOWN_DEG)
+);
 function animate(){
-  // Raycast depuis la direction du regard (caméra), indépendant des manettes/mains
-  const dir = new THREE.Vector3();
-  camera.getWorldDirection(dir);
+  // Direction du regard = avant de la caméra, incliné vers le bas de HEAD_TILT_DOWN_DEG
+  // (même angle que la position visuelle du reticle, sinon les deux ne coïncident plus)
+  const camQuat = new THREE.Quaternion();
+  camera.getWorldQuaternion(camQuat);
+  const dir = new THREE.Vector3(0,0,-1).applyQuaternion(GAZE_TILT_QUAT).applyQuaternion(camQuat).normalize();
   const origin = new THREE.Vector3();
   camera.getWorldPosition(origin);
   const raycaster = new THREE.Raycaster(origin, dir);
 
-  const visibleMeshes = hotspotObjects.filter(h=>h.mesh.visible).map(h=>h.mesh);
+  const visibleMeshes = hotspotObjects.filter(h=>h.mesh.visible && h.interactive).map(h=>h.mesh);
   const hits = raycaster.intersectObjects(visibleMeshes);
 
   if (hits.length > 0){
