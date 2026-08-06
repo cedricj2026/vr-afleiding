@@ -1,0 +1,687 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+<meta charset="UTF-8">
+<title>Lecteur VR maison - Gaze Trigger</title>
+<style>
+  html, body { margin:0; padding:0; overflow:hidden; background:#000; height:100%; }
+  #overlay {
+    position:fixed; inset:0; display:flex; align-items:center; justify-content:center;
+    background:rgba(0,0,0,0.85); color:#fff; font-family:sans-serif; z-index:10; text-align:center;
+  }
+  #overlay button {
+    padding:18px 36px; font-size:20px; border-radius:8px; border:none; cursor:pointer;
+    background:#2b7cff; color:#fff;
+  }
+</style>
+</head>
+<body>
+<div id="overlay">
+  <div>
+    <h2>Module VR — Afleiding achter het stuur</h2>
+    <p>Cliquez pour démarrer (débloque l'audio + le mode VR)</p>
+    <button id="startBtn">Démarrer</button>
+  </div>
+</div>
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+<script>
+/* ============================================================
+   CONFIG — tous les réglages "à la main" regroupés ici.
+   ============================================================ */
+const CONFIG = {
+  DWELL_TIME: 1500,      // ms de regard soutenu pour déclencher un hotspot
+  SCENE_RADIUS: 10,      // échelle des hotspots/images (CenarioVR utilise une sphère unitaire, on l'agrandit)
+
+  // Mode calage : en production, reste à false — les zones de trigger invisibles sont
+  // réellement invisibles et respectent les show/hide programmés dans le scénario.
+  // Repasser à true temporairement si un nouveau réglage de position est nécessaire
+  // (voir version de calibration conservée séparément si besoin de raffiner à nouveau).
+  CALIBRATION_MODE: false,
+
+  // Calibration CAMÉRA (orientation de départ) par scène — valeurs calées manuellement
+  CAMERA_MANUAL_YAW: { '3': -50.2, '4': -55 }, // Situation1, Situation2
+
+  // Angle caméra appliqué automatiquement en entrant dans une vidéo atteinte
+  // depuis le hub Situation1 (id '3') ou Situation2 (id '4') après avoir fixé
+  // un hotspot de distraction — s'applique à toute scène qui n'a pas sa propre
+  // entrée dans CAMERA_MANUAL_YAW ci-dessus.
+  HUB_TO_VIDEO_CAMERA_YAW: -50,
+
+  // Décalage de base de la COUCHE hotspot par scène (trouvé empiriquement) — s'applique
+  // à tous les hotspots de la scène (icônes ET triggers) qui n'ont pas de calage individuel
+  // plus précis ci-dessous. Le rond bleu (déjà bien placé) dépend de cette valeur : ne pas y
+  // toucher sans revérifier sa position.
+  HOTSPOT_LAYER_BASE_YAW: { '3': -150, '4': -150 }, // Situation1, Situation2
+
+  // Calage INDIVIDUEL d'un hotspot précis, par NOM exact (angle absolu en degrés).
+  // clé = "idDeScène:nomDeLObjet". Le plus fiable si le nom scenario.json est connu —
+  // prioritaire sur tout le reste. Vide pour l'instant : on ne connaît pas encore le nom
+  // exact du bouton "recommencer" (à lire dans le panneau de sélection en jeu, voir plus bas).
+  HOTSPOT_YAW_OVERRIDE: {
+  },
+
+  // Calage par NOM SEUL, sans distinction de scène (ex: le bouton restart, identique
+  // dans toutes les vidéos où il apparaît) — vérifié en dernier recours.
+  HOTSPOT_YAW_OVERRIDE_BY_NAME: {
+    'restart': 195
+  },
+
+  // Calage INDIVIDUEL des 2 zones de trigger invisibles par scène, par INDEX d'apparition
+  // dans scenario.json (0 = premier trigger rencontré dans la scène, 1 = deuxième) —
+  // utilisé quand le nom exact n'est pas fiable. C'est juste un point de DÉPART : on peut
+  // affiner en jeu (regarder le hotspot pour le sélectionner, puis flèches vertes).
+  TRIGGER_MANUAL_YAW_BY_INDEX: {
+    '3': [-20, -100], // Situation1 — distraction 1, distraction 2
+    '4': [-240, -130]   // Situation2 — distraction 1, distraction 2
+  },
+
+  // Décalage fixe du panorama seul (trouvé empiriquement), indépendant des hotspots
+  PANORAMA_EXTRA_YAW: { '1': -90 }, // Photo1 : image 360 décalée de 90° vers la droite
+
+  // Échange gauche/droite demandé pour certains objets nommés
+  SWAP_YAW: {
+    'Vignette1': -38.75723501073947,
+    'play situation 1': -38.75723501073947,
+    'Vignette2': 45.95633734313346,
+    'play situation 2': 45.95633734313346
+  }
+};
+
+/* ============================================================
+   LOG — console uniquement en version finale (pas d'affichage
+   dans le casque). Utile en cas de débogage via inspection distante.
+   ============================================================ */
+function log(msg){
+  console.log(msg);
+}
+window.addEventListener('error', (e) => {
+  log('ERREUR JS: ' + e.message + ' (' + e.filename + ':' + e.lineno + ')');
+});
+window.addEventListener('unhandledrejection', (e) => {
+  log('ERREUR PROMISE: ' + e.reason);
+});
+
+/* ============================================================
+   ÉTAT — scénario chargé + objets THREE.js
+   ============================================================ */
+let scenario = null;
+let sceneMap = {};
+let currentSceneId = null;
+
+let scene, camera, renderer, sphereMesh, videoEl, reticle, reticleInner;
+let sceneGroup, panoramaGroup, iconHotspotGroup, triggerZoneGroup;
+// hotspotObjects : { mesh, data, isTrigger } — isTrigger = zone invisible de calage (pas d'icône src)
+let hotspotObjects = [];
+let ambientAudioEls = [];
+let sceneTimers = []; // setTimeout actifs pour la scène en cours
+let currentHover = null;
+let hoverStart = 0;
+
+init();
+
+/* ============================================================
+   INITIALISATION
+   ============================================================ */
+async function init() {
+  log('Chargement scenario.json...');
+  try {
+    const res = await fetch('scenario.json');
+    if (!res.ok) { log('ERREUR fetch scenario.json: HTTP '+res.status); return; }
+    scenario = await res.json();
+    log('scenario.json chargé, '+scenario.scenes.length+' scènes');
+  } catch(e){
+    log('ERREUR chargement scenario.json: '+e.message);
+    return;
+  }
+  scenario.scenes.forEach(s => sceneMap[s.id] = s);
+
+  scene = new THREE.Scene();
+  sceneGroup = new THREE.Group();
+  panoramaGroup = new THREE.Group();
+  iconHotspotGroup = new THREE.Group();   // icônes déjà bien calées (rond bleu, etc.) — figé
+  triggerZoneGroup = new THREE.Group();   // zones invisibles de trigger — réglable indépendamment
+  sceneGroup.add(panoramaGroup);
+  sceneGroup.add(iconHotspotGroup);
+  sceneGroup.add(triggerZoneGroup);
+  scene.add(sceneGroup);
+  camera = new THREE.PerspectiveCamera(75, window.innerWidth/window.innerHeight, 0.1, 200);
+
+  renderer = new THREE.WebGLRenderer({ antialias:true, alpha:false });
+  renderer.setSize(window.innerWidth, window.innerHeight);
+  renderer.xr.enabled = true;
+  document.body.appendChild(renderer.domElement);
+  log('Renderer WebGL initialisé, WebXR activé: '+renderer.xr.enabled);
+
+  // Détecte une perte de contexte WebGL (fréquent sur casque autonome quand la
+  // mémoire GPU sature avec des vidéos 360° lourdes) et tente une reprise auto.
+  renderer.domElement.addEventListener('webglcontextlost', (e) => {
+    e.preventDefault();
+    log('ERREUR: contexte WebGL perdu (mémoire GPU probablement saturée)');
+  }, false);
+  renderer.domElement.addEventListener('webglcontextrestored', () => {
+    log('Contexte WebGL restauré — rechargement de la scène en cours');
+    if (currentSceneId) loadScene(currentSceneId);
+  }, false);
+
+  addVRButton(); // bouton "Entrer en VR" natif WebXR (nécessite HTTPS)
+
+  buildReticle();
+
+  window.addEventListener('resize', onResize);
+
+  document.getElementById('startBtn').addEventListener('click', () => {
+    document.getElementById('overlay').style.display = 'none';
+    loadScene(scenario.scenes[0].id);
+    renderer.setAnimationLoop(animate);
+  });
+}
+
+function onResize(){
+  camera.aspect = window.innerWidth/window.innerHeight;
+  camera.updateProjectionMatrix();
+  renderer.setSize(window.innerWidth, window.innerHeight);
+}
+
+function addVRButton(){
+  const btn = document.createElement('button');
+  btn.textContent = 'ENTRER EN VR';
+  btn.style.cssText = 'position:fixed;bottom:20px;left:50%;transform:translateX(-50%);padding:14px 28px;z-index:20;font-size:16px;border-radius:8px;border:none;background:#28a745;color:#fff;cursor:pointer;';
+  document.body.appendChild(btn);
+  btn.addEventListener('click', async () => {
+    if (!navigator.xr) { log('navigator.xr indisponible (HTTPS ?)'); return; }
+    log('Vérification support immersive-vr...');
+    const supported = await navigator.xr.isSessionSupported('immersive-vr');
+    log('Support immersive-vr: '+supported);
+    if (!supported) { return; }
+    try {
+      renderer.xr.setReferenceSpaceType('local');
+      const session = await navigator.xr.requestSession('immersive-vr', { optionalFeatures: ['local-floor'] });
+      log('Session XR obtenue');
+      session.addEventListener('end', () => log('Session XR terminée'));
+      await renderer.xr.setSession(session);
+      log('renderer.xr.setSession OK');
+      btn.style.display = 'none';
+    } catch(e){
+      log('ERREUR requestSession: '+e.message);
+    }
+  });
+}
+
+/* ============================================================
+   RETICLE (attaché à la caméra) — indicateur de regard + progression
+   ============================================================ */
+function buildReticle(){
+  reticle = new THREE.Group();
+  const ringGeo = new THREE.RingGeometry(0.012, 0.016, 32);
+  const ringMat = new THREE.MeshBasicMaterial({ color:0xffffff, transparent:true, opacity:0.9, side:THREE.DoubleSide, depthTest:false });
+  const ring = new THREE.Mesh(ringGeo, ringMat);
+  reticle.add(ring);
+
+  const innerGeo = new THREE.CircleGeometry(0.011, 32);
+  const innerMat = new THREE.MeshBasicMaterial({ color:0x2b7cff, transparent:true, opacity:0, depthTest:false });
+  reticleInner = new THREE.Mesh(innerGeo, innerMat);
+  reticle.add(reticleInner);
+
+  reticle.position.set(0,0,-1.5); // toujours à 1.5m devant la caméra
+  reticle.renderOrder = 999;
+  camera.add(reticle);
+  scene.add(camera);
+}
+
+/* ============================================================
+   ICÔNES (textures depuis SVG/PNG, robuste aux tailles manquantes)
+   ============================================================ */
+function loadIconTexture(src, onReady, size=256, forceWhite=true){
+  const img = new Image();
+  img.crossOrigin = 'anonymous';
+  img.onload = () => {
+    const canvas = document.createElement('canvas');
+    canvas.width = size; canvas.height = size;
+    const ctx = canvas.getContext('2d');
+    const iw = img.naturalWidth || size, ih = img.naturalHeight || size;
+    const scale = Math.min(size/iw, size/ih);
+    const dw = iw*scale, dh = ih*scale;
+    ctx.clearRect(0,0,size,size);
+    ctx.drawImage(img, (size-dw)/2, (size-dh)/2, dw, dh);
+    if (forceWhite){
+      ctx.globalCompositeOperation = 'source-in';
+      ctx.fillStyle = '#ffffff';
+      ctx.fillRect(0,0,size,size);
+      ctx.globalCompositeOperation = 'source-over';
+    }
+    const tex = new THREE.CanvasTexture(canvas);
+    tex.needsUpdate = true;
+    onReady(tex);
+    log('Icône chargée OK ('+iw+'x'+ih+'): '+src.split('/').pop());
+  };
+  img.onerror = () => log('ERREUR chargement icône: '+src);
+  img.src = src;
+}
+
+/* ============================================================
+   GÉOMÉTRIE — conversion pitch/yaw et positionnement des hotspots
+   ============================================================ */
+function pitchYawToPosition(pitch, yaw, distance){
+  const p = THREE.MathUtils.degToRad(pitch);
+  const y = THREE.MathUtils.degToRad(yaw);
+  const x = distance * Math.cos(p) * Math.sin(y);
+  const yy = distance * Math.sin(p);
+  const z = -distance * Math.cos(p) * Math.cos(y);
+  return new THREE.Vector3(x, yy, z);
+}
+
+// Repositionne un hotspot d'après son yaw effectif (baseYawDeg + manualYawDeg, ce
+// dernier venant des réglages figés dans CONFIG — voir computeHotspotSeed).
+function repositionHotspot(h){
+  const yaw = h.baseYawDeg + h.manualYawDeg;
+  const pos = pitchYawToPosition(h.pitchDeg, yaw, h.distanceVal);
+  h.mesh.position.copy(pos);
+  h.mesh.lookAt(0,0,0);
+}
+
+let manualYawOffsetDeg = 0; // calage caméra courant (voir applySceneRotation)
+
+let currentDefaultYaw = 0;
+function applySceneRotation(defaultYaw){
+  currentDefaultYaw = defaultYaw;
+  sceneGroup.rotation.y = THREE.MathUtils.degToRad(defaultYaw + manualYawOffsetDeg);
+}
+
+/* ============================================================
+   GESTION DES SCÈNES
+   ============================================================ */
+// Libère la mémoire GPU (géométrie + matériau + texture) d'un mesh — three.js ne
+// le fait jamais automatiquement quand on retire un objet de la scène.
+function disposeMaterial(mat){
+  if (!mat) return;
+  if (Array.isArray(mat)) { mat.forEach(disposeMaterial); return; }
+  if (mat.map) mat.map.dispose();
+  mat.dispose();
+}
+function disposeObject3D(obj){
+  if (obj.geometry) obj.geometry.dispose();
+  if (obj.material) disposeMaterial(obj.material);
+}
+
+let ambientVideoEls = []; // vidéos-objets (obj.type === 'video'), en plus de la vidéo panoramique principale
+let videoTimersState = []; // timers de la scène vidéo courante : {time, actions, fired}
+let lastCheckedVideoMs = 0; // dernière position de lecture vérifiée (voir listener 'timeupdate')
+
+function clearCurrentScene(){
+  sceneTimers.forEach(t => clearTimeout(t));
+  sceneTimers = [];
+  videoTimersState = [];
+  lastCheckedVideoMs = 0;
+  hotspotObjects = [];
+
+  ambientAudioEls.forEach(a => { a.pause(); a.removeAttribute('src'); a.load(); });
+  ambientAudioEls = [];
+  ambientVideoEls.forEach(v => { v.pause(); v.removeAttribute('src'); v.load(); });
+  ambientVideoEls = [];
+
+  [panoramaGroup, iconHotspotGroup, triggerZoneGroup].forEach(group => {
+    [...group.children].forEach(c => { group.remove(c); disposeObject3D(c); });
+  });
+  sceneGroup.rotation.set(0,0,0);
+  panoramaGroup.rotation.set(0,0,0);
+  iconHotspotGroup.rotation.set(0,0,0);
+  triggerZoneGroup.rotation.set(0,0,0);
+
+  if (videoEl){
+    videoEl.pause();
+    videoEl.removeAttribute('src');
+    videoEl.load(); // force la libération des buffers de décodage vidéo
+    videoEl.remove();
+    videoEl = null;
+  }
+  sphereMesh = null;
+}
+
+function buildPanoramaSphere(){
+  const geometry = new THREE.SphereGeometry(50, 60, 40);
+  geometry.scale(-1,1,1); // texture visible de l'intérieur
+  return geometry;
+}
+
+let previousSceneId = null;
+function loadScene(sceneId){
+  try {
+    loadSceneInner(sceneId);
+  } catch(e){
+    log('ERREUR FATALE dans loadScene('+sceneId+'): '+e.message);
+  }
+}
+
+function loadSceneInner(sceneId){
+  const s = sceneMap[sceneId];
+  if (!s){ log('Scène introuvable: '+sceneId); return; }
+  previousSceneId = currentSceneId;
+  currentSceneId = sceneId;
+  manualYawOffsetDeg = 0;
+  clearCurrentScene();
+  log('Scène: '+s.name+' (id='+sceneId+', venant de id='+previousSceneId+')');
+
+  const geometry = buildPanoramaSphere();
+
+  if (s.video){
+    log('Chargement vidéo: '+s.video);
+    videoEl = document.createElement('video');
+    videoEl.src = s.video;
+    videoEl.crossOrigin = 'anonymous';
+    videoEl.loop = !!s.loop;
+    videoEl.playsInline = true;
+    videoEl.setAttribute('webkit-playsinline','true');
+    videoEl.autoplay = true;
+    videoEl.muted = false;
+    videoEl.addEventListener('loadeddata', ()=> log('Vidéo prête (loadeddata): '+s.video));
+    videoEl.addEventListener('playing', ()=> log('Vidéo en lecture: '+s.video));
+    videoEl.addEventListener('error', ()=> log('ERREUR vidéo ('+s.video+'): code '+(videoEl.error?videoEl.error.code:'?')));
+    videoEl.play().then(()=>log('play() OK')).catch(e=>{
+      log('Autoplay bloqué ('+e.message+'), tentative en muet...');
+      videoEl.muted = true;
+      videoEl.play().then(()=>log('play() OK (muet)')).catch(e2=>log('ERREUR play() même muet: '+e2.message));
+    });
+
+    const tex = new THREE.VideoTexture(videoEl);
+    tex.minFilter = THREE.LinearFilter;
+    tex.magFilter = THREE.LinearFilter;
+    const mat = new THREE.MeshBasicMaterial({ map: tex });
+    sphereMesh = new THREE.Mesh(geometry, mat);
+    panoramaGroup.add(sphereMesh);
+    log('Sphère vidéo ajoutée à la scène');
+
+    if (s.actions && s.actions.some(a=>a.action==='link')){
+      videoEl.addEventListener('ended', () => {
+        try {
+          const linkAction = s.actions.find(a=>a.action==='link');
+          if (linkAction) loadScene(linkAction.target);
+        } catch(e){
+          log('ERREUR au changement de scène (fin vidéo): '+e.message);
+        }
+      });
+    }
+
+    // Timers basés sur la POSITION DE LECTURE réelle de la vidéo (currentTime), pas sur
+    // l'horloge écoulée depuis le chargement de la scène. Indispensable dès qu'un "jump"
+    // peut sauter en avant dans la vidéo : un setTimeout classique se déclencherait au
+    // mauvais moment (trop tôt ou trop tard) par rapport à ce que montre réellement la vidéo.
+    videoTimersState = (s.timers||[]).map(t => ({ time: t.time, actions: t.actions, fired:false }));
+    lastCheckedVideoMs = 0;
+    videoEl.addEventListener('timeupdate', () => {
+      const curMs = videoEl.currentTime * 1000;
+      videoTimersState.forEach(vt => {
+        if (!vt.fired && vt.time > lastCheckedVideoMs && vt.time <= curMs){
+          vt.fired = true;
+          try { runActions(vt.actions); } catch(e){ log('ERREUR timer vidéo ('+vt.time+'ms): '+e.message); }
+        }
+      });
+      lastCheckedVideoMs = curMs;
+    });
+  } else if (s.image){
+    log('Chargement image: '+s.image);
+    const loader = new THREE.TextureLoader();
+    loader.load(s.image,
+      (tex) => {
+        const mat = new THREE.MeshBasicMaterial({ map: tex });
+        sphereMesh = new THREE.Mesh(geometry, mat);
+        panoramaGroup.add(sphereMesh);
+        log('Sphère image ajoutée à la scène');
+      },
+      undefined,
+      (err) => log('ERREUR chargement image '+s.image+': '+err)
+    );
+    // Pas de vidéo ici, donc pas de currentTime à suivre : les timers d'une scène photo
+    // (ex. l'indice qui apparaît après 15s sur Photo1) restent basés sur l'horloge classique.
+    if (s.timers){
+      s.timers.forEach(t => {
+        const handle = setTimeout(() => runActions(t.actions), t.time);
+        sceneTimers.push(handle);
+      });
+    }
+  }
+
+  // Objets de la scène (hotspots, images, audio) — on compte les triggers rencontrés
+  // dans l'ordre pour le calage par index (voir CONFIG.TRIGGER_MANUAL_YAW_BY_INDEX)
+  let triggerIndex = 0;
+  (s.objects||[]).forEach(obj => {
+    buildObject(obj, sceneId, triggerIndex);
+    if (obj.type === 'hotspot' && !obj.src) triggerIndex++;
+  });
+
+  // Orientation de départ : on tourne tout le contenu de la scène pour que
+  // la direction "default_yaw" prévue par CenarioVR corresponde à ce que
+  // l'utilisateur voit droit devant lui en entrant dans la scène.
+  if (typeof s.default_yaw === 'number'){
+    const videoCorrection = s.video ? 180 : 0; // décalage constaté entre scènes vidéo et photo
+    if (CONFIG.CAMERA_MANUAL_YAW[sceneId] !== undefined){
+      manualYawOffsetDeg = CONFIG.CAMERA_MANUAL_YAW[sceneId];
+    } else if (previousSceneId === '3' || previousSceneId === '4'){
+      // On arrive dans une vidéo depuis un des deux hubs (après un choix de distraction)
+      manualYawOffsetDeg = CONFIG.HUB_TO_VIDEO_CAMERA_YAW;
+    } else {
+      manualYawOffsetDeg = 0;
+    }
+    applySceneRotation(s.default_yaw + videoCorrection);
+  }
+
+  // Décalage fixe du panorama seul (trouvé empiriquement), indépendant des hotspots
+  panoramaGroup.rotation.y = THREE.MathUtils.degToRad(CONFIG.PANORAMA_EXTRA_YAW[sceneId] || 0);
+}
+
+/* ============================================================
+   CONSTRUCTION DES OBJETS DE SCÈNE
+   ============================================================ */
+// Détermine le point de départ (baseYawDeg + manualYawDeg) d'un hotspot :
+// 1) calage par nom exact (le plus fiable, une fois le nom connu)
+// 2) calage par index, seulement pour les triggers (2 par scène : distraction 1 et 2)
+// 3) sinon : valeur d'origine du scénario + décalage de couche de la scène
+function computeHotspotSeed(obj, sceneId, isTrigger, triggerIndex, defaultYawVal){
+  const nameOverride = CONFIG.HOTSPOT_YAW_OVERRIDE[sceneId+':'+obj.name];
+  if (nameOverride !== undefined) return { baseYawDeg: 0, manualYawDeg: nameOverride };
+
+  const globalNameOverride = CONFIG.HOTSPOT_YAW_OVERRIDE_BY_NAME[obj.name];
+  if (globalNameOverride !== undefined) return { baseYawDeg: 0, manualYawDeg: globalNameOverride };
+
+  if (isTrigger){
+    const idxVal = (CONFIG.TRIGGER_MANUAL_YAW_BY_INDEX[sceneId]||[])[triggerIndex];
+    if (idxVal !== undefined) return { baseYawDeg: 0, manualYawDeg: idxVal };
+  }
+
+  const layerBase = CONFIG.HOTSPOT_LAYER_BASE_YAW[sceneId] || 0;
+  return { baseYawDeg: defaultYawVal + layerBase, manualYawDeg: 0 };
+}
+
+function buildObject(obj, sceneId, triggerIndex){
+  const defaultYawVal = CONFIG.SWAP_YAW[obj.name] !== undefined ? CONFIG.SWAP_YAW[obj.name] : (obj.yaw||0);
+
+  if (obj.type === 'hotspot'){
+    const isTrigger = !obj.src; // pas d'icône = zone de trigger invisible (calage)
+    const seed = computeHotspotSeed(obj, sceneId, isTrigger, triggerIndex, defaultYawVal);
+    const w = (obj.width || 0.2) * CONFIG.SCENE_RADIUS, h = (obj.height || 0.2) * CONFIG.SCENE_RADIUS;
+    const geo = new THREE.PlaneGeometry(w, h);
+
+    let mat;
+    if (obj.src){
+      mat = new THREE.MeshBasicMaterial({ color:0xffffff, transparent:true, opacity:1, side:THREE.DoubleSide, depthTest:true });
+      loadIconTexture(obj.src, (tex) => { mat.map = tex; mat.needsUpdate = true; });
+    } else {
+      // Zone de trigger invisible mais toujours regardable/cliquable
+      mat = new THREE.MeshBasicMaterial({ color:0xff3333, transparent:true, opacity:0.01, side:THREE.DoubleSide, depthTest:true });
+    }
+
+    const mesh = new THREE.Mesh(geo, mat);
+    mesh.renderOrder = 5;
+    mesh.visible = obj.visible !== false;
+
+    (isTrigger ? triggerZoneGroup : iconHotspotGroup).add(mesh);
+    const entry = {
+      mesh, data: obj, isTrigger,
+      pitchDeg: obj.pitch||0,
+      // Distance légèrement réduite pour être toujours rendu devant les images (évite le z-fighting)
+      distanceVal: (obj.distance||1) * CONFIG.SCENE_RADIUS * 0.97,
+      baseYawDeg: seed.baseYawDeg,
+      manualYawDeg: seed.manualYawDeg
+    };
+    repositionHotspot(entry);
+    hotspotObjects.push(entry);
+  }
+
+  else if (obj.type === 'image' && obj.src){
+    if (obj.name === 'CVR Encap') return; // repère de calage, plus utilisé — on ne le construit pas
+    const seed = computeHotspotSeed(obj, sceneId, false, -1, defaultYawVal);
+    const w = (obj.width || 0.5) * CONFIG.SCENE_RADIUS, h = (obj.height || 0.5) * CONFIG.SCENE_RADIUS;
+    const geo = new THREE.PlaneGeometry(w, h);
+    const mat = new THREE.MeshBasicMaterial({ transparent:true, opacity: obj.opacity!==undefined?obj.opacity:1, side:THREE.DoubleSide });
+    const loader = new THREE.TextureLoader();
+    loader.load(obj.src,
+      (tex) => { mat.map = tex; mat.needsUpdate = true; log('Texture image OK: '+obj.name); },
+      undefined,
+      (err) => log('ERREUR texture image '+obj.name+': '+err)
+    );
+    const mesh = new THREE.Mesh(geo, mat);
+    mesh.renderOrder = 1;
+    mesh.visible = obj.visible !== false;
+    iconHotspotGroup.add(mesh); // décoratif, suit le calage des icônes
+    const entry = {
+      mesh, data: obj, isTrigger: false,
+      pitchDeg: obj.pitch||0,
+      distanceVal: (obj.distance||1) * CONFIG.SCENE_RADIUS,
+      baseYawDeg: seed.baseYawDeg,
+      manualYawDeg: seed.manualYawDeg
+    };
+    repositionHotspot(entry);
+    hotspotObjects.push(entry); // sélectionnable/réglable comme les hotspots si besoin plus tard
+  }
+
+  // Vidéo-objet dans la scène (distincte de la vidéo panoramique principale s.video) —
+  // n'était pas gérée jusqu'ici : tout obj.type === 'video' était silencieusement ignoré.
+  else if (obj.type === 'video' && obj.src){
+    const w = (obj.width || 0.5) * CONFIG.SCENE_RADIUS, h = (obj.height || 0.5) * CONFIG.SCENE_RADIUS;
+    const geo = new THREE.PlaneGeometry(w, h);
+    const vid = document.createElement('video');
+    vid.src = obj.src;
+    vid.crossOrigin = 'anonymous';
+    vid.loop = !!obj.loop;
+    vid.playsInline = true;
+    vid.setAttribute('webkit-playsinline','true');
+    vid.autoplay = true;
+    vid.muted = obj.muted !== undefined ? !!obj.muted : true; // muet par défaut pour garantir l'autoplay
+    vid.addEventListener('loadeddata', ()=> log('Vidéo objet prête: '+obj.name));
+    vid.addEventListener('playing', ()=> log('Vidéo objet en lecture: '+obj.name));
+    vid.addEventListener('error', ()=> log('ERREUR vidéo objet ('+obj.name+'): code '+(vid.error?vid.error.code:'?')));
+    vid.play().catch(e=> log('Autoplay bloqué pour vidéo objet '+obj.name+': '+e.message));
+    const tex = new THREE.VideoTexture(vid);
+    tex.minFilter = THREE.LinearFilter;
+    tex.magFilter = THREE.LinearFilter;
+    const mat = new THREE.MeshBasicMaterial({ map: tex, transparent:true, opacity: obj.opacity!==undefined?obj.opacity:1, side:THREE.DoubleSide });
+    const mesh = new THREE.Mesh(geo, mat);
+    const pos = pitchYawToPosition(obj.pitch||0, defaultYawVal, (obj.distance||1) * CONFIG.SCENE_RADIUS);
+    mesh.position.copy(pos);
+    mesh.lookAt(0,0,0);
+    mesh.renderOrder = 2;
+    mesh.visible = obj.visible !== false;
+    iconHotspotGroup.add(mesh);
+    ambientVideoEls.push(vid);
+  }
+
+  else if (obj.type === 'audio' && obj.src){
+    const a = document.createElement('audio');
+    a.src = obj.src;
+    a.loop = !!obj.loop;
+    a.muted = !!obj.muted;
+    a.volume = obj.volume!==undefined ? obj.volume : 1;
+    a.play().catch(e=>console.warn('Autoplay audio bloqué', e));
+    ambientAudioEls.push(a);
+  }
+}
+
+/* ============================================================
+   ACTIONS (déclenchées par regard soutenu ou par un timer)
+   ============================================================ */
+function findHotspotById(id){
+  return hotspotObjects.find(h => h.data.id === id);
+}
+
+function runActions(actions){
+  if (!actions) return;
+  actions.forEach(a => {
+    if (!a || !a.action) return;
+    if (a.action === 'link'){ loadScene(a.target); }
+    else if (a.action === 'jump'){
+      // Sur ce scénario, "jump" cible un temps en secondes dans la vidéo courante
+      // (pas un id de scène) — ex: Distraction en Situation2 saute vers la fin.
+      const t = parseFloat(a.target);
+      if (videoEl && !isNaN(t)){
+        videoEl.currentTime = t;
+        lastCheckedVideoMs = t * 1000; // on ignore les timers situés avant le point d'arrivée du saut
+        log('jump: vidéo -> '+t+'s');
+      } else if (sceneMap[a.target]){
+        loadScene(a.target);
+      } else {
+        log('jump: cible non gérée: '+a.target);
+      }
+    }
+    else if (a.action === 'show'){
+      const h = findHotspotById(a.target);
+      if (h) h.mesh.visible = true;
+    }
+    else if (a.action === 'hide'){
+      const h = findHotspotById(a.target);
+      if (h) h.mesh.visible = false;
+    }
+    else if (a.action === 'pause'){ if (videoEl) videoEl.pause(); }
+  });
+}
+
+function triggerHotspot(h){
+  try {
+    runActions(h.data.actions);
+  } catch(e){
+    log('ERREUR dans triggerHotspot: '+e.message);
+  }
+}
+
+/* ============================================================
+   BOUCLE DE RENDU
+   ============================================================ */
+let lastFrameTime = performance.now();
+function animate(){
+  // Raycast depuis la direction du regard (caméra), indépendant des manettes/mains
+  const dir = new THREE.Vector3();
+  camera.getWorldDirection(dir);
+  const origin = new THREE.Vector3();
+  camera.getWorldPosition(origin);
+  const raycaster = new THREE.Raycaster(origin, dir);
+
+  const visibleMeshes = hotspotObjects.filter(h=>h.mesh.visible).map(h=>h.mesh);
+  const hits = raycaster.intersectObjects(visibleMeshes);
+
+  if (hits.length > 0){
+    const hovered = hotspotObjects.find(h => h.mesh === hits[0].object);
+    if (currentHover !== hovered){
+      currentHover = hovered;
+      hoverStart = performance.now();
+    }
+    const elapsed = performance.now() - hoverStart;
+    const progress = Math.min(elapsed / CONFIG.DWELL_TIME, 1);
+    reticleInner.material.opacity = progress * 0.9;
+    reticleInner.scale.setScalar(0.3 + progress*0.7);
+
+    if (progress >= 1){
+      triggerHotspot(currentHover);
+      currentHover = null; // évite de redéclencher en boucle tant que le regard reste dessus
+      hoverStart = performance.now() + 999999; // verrou temporaire
+      setTimeout(()=>{ hoverStart = performance.now(); }, 800);
+    }
+  } else {
+    currentHover = null;
+    reticleInner.material.opacity = 0;
+    reticleInner.scale.setScalar(0.3);
+  }
+
+  renderer.render(scene, camera);
+}
+</script>
+</body>
+</html>
