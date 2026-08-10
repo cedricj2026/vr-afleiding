@@ -31,7 +31,7 @@
    ============================================================ */
 const CONFIG = {
   DWELL_TIME: 1000,      // ms de regard soutenu pour déclencher un hotspot
-  HEAD_TILT_DOWN_DEG: 10, // incline le regard/reticule vers le bas (position plus naturelle)
+  HEAD_TILT_DOWN_DEG: 15, // incline le regard/reticule vers le bas (position plus naturelle)
   SCENE_RADIUS: 10,      // échelle des hotspots/images (CenarioVR utilise une sphère unitaire, on l'agrandit)
 
   // Mode calage : en production, reste à false — les zones de trigger invisibles sont
@@ -47,7 +47,7 @@ const CONFIG = {
   // depuis le hub Situation1 (id '3') ou Situation2 (id '4') après avoir fixé
   // un hotspot de distraction — s'applique à toute scène qui n'a pas sa propre
   // entrée dans CAMERA_MANUAL_YAW ci-dessus.
-  HUB_TO_VIDEO_CAMERA_YAW: -10, // estimé : à ajuster si pas exactement face au titre
+  HUB_TO_VIDEO_CAMERA_YAW: -50,
 
   // Décalage de base de la COUCHE hotspot par scène (trouvé empiriquement) — s'applique
   // à tous les hotspots de la scène (icônes ET triggers) qui n'ont pas de calage individuel
